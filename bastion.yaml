@@ -1,0 +1,17 @@
+---
+- name: Bastion 자동화
+  hosts: bastion
+  become: yes
+  vars:
+    backup_file_path: "/opt/backup/jenkins-backup.tar.gz"
+    s3_bucket: "s3://jenkins-backup-bucket2"
+
+  tasks:
+    - name: S3로 백업 업로드
+      shell: aws s3 cp {{ backup_file_path }} {{ s3_bucket }}
+      register: s3_upload_result
+
+    - name: S3 업로드 결과 출력
+      debug:
+        var: s3_upload_result.stdout_lines
+
