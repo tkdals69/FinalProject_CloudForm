@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Jenkins EC2 with S3 backup restore, ASG AutoRecovery, ALB, CloudWatch Alarm (Reuse existing Target Group)
+
+Parameters:
+  KeyName:
+    Type: String
+    Default: Project
+    Description: EC2 Key Pair name for SSH access
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0fb7b61eb36a27c9e
+    Description: VPC ID for EC2, ALB, etc.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-038a777159c46a60e
+    Description: Subnet ID (public preferred for ALB access)
+
+  JenkinsTargetGroupArn:
+    Type: String
+    Default: arn:aws:elasticloadbalancing:ap-northeast-2:070561229556:targetgroup/jenkins-tg/5efae44f4c7f68f2
+    Description: Jenkins Target Group ARN
+
+Resources:
+  JenkinsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: JenkinsRegisterRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: JenkinsRegisterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:RegisterTargets
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::jenkins-backup-bucket2
+                  - arn:aws:s3:::jenkins-backup-bucket2/*
+
+  JenkinsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: JenkinsInstanceProfile
+      Roles:
+        - !Ref JenkinsRole
+
+  JenkinsLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: jenkins-launch-template
+      LaunchTemplateData:
+        InstanceType: t3.medium
+        ImageId: ami-05377cf8cfef186c2
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref JenkinsInstanceProfile
+        SecurityGroupIds:
+          - sg-00e8bba08529cbdf0
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: Jenkins-EC2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 30        # <-- ??? ??? ??!
+              VolumeType: gp3       # gp3 ??
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf install -y docker java-17-amazon-corretto maven awscli cronie git
+            dnf -y install git ansible
+            sudo usermod -aG docker ec2-user
+            sudo wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+            sudo rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+            sudo yum -y install fontconfig
+            sudo dnf -y install jenkins
+            sudo systemctl daemon-reload
+            systemctl enable jenkins
+            systemctl restart docker
+            sudo usermod -aG docker jenkins
+
+            aws s3 cp s3://jenkins-backup-bucket2/jenkins-backup.tar.gz /tmp/
+            tar -xzvf /tmp/jenkins-backup.tar.gz -C /
+            chown -R jenkins:jenkins /var/lib/jenkins
+            
+            systemctl restart jenkins
+
+            TG_ARN="${JenkinsTargetGroupArn}"
+
+            for i in {1..10}; do
+              TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
+              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              if [[ -n "$INSTANCE_ID" ]]; then
+                break
+              fi
+              sleep 5
+            done
+
+            if [[ -z "$INSTANCE_ID" ]]; then
+              echo "[ERROR] Failed to get INSTANCE_ID" | sudo tee -a /var/log/userdata.debug.log
+              exit 1
+            fi
+
+            aws elbv2 register-targets --target-group-arn "$TG_ARN" --targets Id=$INSTANCE_ID,Port=8080
+
+            sudo mkdir /opt/backup
+            cd /opt/backup
+            git clone https://github.com/tkdals69/FinalProject_CloudForm.git
+            cp -r FinalProject_CloudForm/* .
+            rm -rf FinalProject_CloudForm
+            chmod +x /opt/backup/
+            echo "0 1 1 * * ec2-user /opt/backup/backup.sh" >> /etc/crontab
+            systemctl restart crond
+
+            echo "? Jenkins EC2 registered to ALB Target Group"
+
+  JenkinsAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      TargetGroupARNs:
+        - !Ref JenkinsTargetGroupArn
+      LaunchTemplate:
+        LaunchTemplateId: !Ref JenkinsLaunchTemplate
+        Version: !GetAtt JenkinsLaunchTemplate.LatestVersionNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+
+  JenkinsStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Jenkins EC2 ???? ?? ?? (ASG ?? ??)"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref JenkinsAutoScalingGroup
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+Outputs:
+  AutoScalingGroupName:
+    Value: !Ref JenkinsAutoScalingGroup
+    Description: Name of the Jenkins AutoScalingGroup
+
+  CloudWatchAlarmName:
+    Value: !Ref JenkinsStatusCheckAlarm
+    Description: CloudWatch Alarm Name for Jenkins Instance Health
